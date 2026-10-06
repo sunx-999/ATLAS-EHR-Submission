@@ -1,0 +1,261 @@
+# ATLAS-EHR Multi-Phase Project Configuration
+# Philosophy: "Unified Configuration, Hierarchical Execution"
+
+# ===========================================================================
+#  PHASE 1: Static Infilling & Representation Learning
+# ===========================================================================
+phase1:
+  # 1. Model Architecture
+  model:
+    embed_dim: 128            # Latent dimension for physiological manifold
+    num_heads: 8              # Multi-modal attention heads
+    num_features: 8000
+
+  # 2. Data Pipeline Settings
+  data:
+    max_seq_len_limit: 400
+    max_set_size_limit: 48    
+
+  # 3. Recipe Settings
+  recipe:
+    # Intra-visit state-token mixer depth (lightweight self-attention blocks)
+    set_layers: 4                     
+    
+    # Temporal Backbone
+    use_delta_t: true                 
+    context_layers: 4
+    predictor_layers: 2               # Keep predictor shallow: VID query fuses current z_set, then reads longitudinal context
+    
+    # Numeric frequency-guided masking
+    mask_target_ratio: 0.15
+    mask_rarity_strength: 0.40
+    mask_min_prob: 0.05
+    mask_max_prob: 0.50
+    static_mask_prob: 0.15
+    static_numeric_vids: [5921]
+    
+    # EMA
+    ema_decay: 0.996                  # Full EMA teacher family for Phase 1
+    
+    
+  # 4. Normalization
+  normalization:
+    value_limit: 10.0                 
+
+  # 5. Training & Hardware
+  training:
+    batch_size: 16
+    accumulate_grad_batches: 2
+    accelerator: auto
+    devices: auto
+    strategy: auto
+    precision: bf16-mixed
+    epochs: 25                        
+    max_lr: 1.0e-4                    
+    weight_decay: 0.02                
+    lr_scheduler:
+      type: "cosine_with_warmup"
+      warmup_steps: 3000
+      min_lr: 1.0e-6
+    gradient_clip_val: 0.5
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 4
+    early_stopping_patience: 8        # Give new token-level query / projector time to settle
+    min_epochs: 12                    # Never stop before this (EMA + new query dynamics need warmup)
+    validation_telemetry_max_tokens: 4096
+    validation_value_intervention_every_n_val_batches: 32
+    validation_value_intervention_max_tokens: 32
+    telemetry_every_n_steps: 50
+
+  performance:
+    # Phase 1 has dynamic timestamp, set-width, and masked-query shapes.
+    # Compile is opt-in only after the GPU benchmark proves it reduces rather
+    # than adds per-shape compilation overhead.
+    compile_enabled: false
+    compile_mode: default
+    activation_checkpointing: auto
+    relative_attention_backend: exact_query_chunked
+    relative_query_chunk_size: 64
+    length_bucketing: true
+    matmul_precision: high
+
+
+
+
+
+readout:
+  architecture: "phase1_target_manifold_inverse_v1"
+  support_fraction: 1.0
+  grid_size: 513
+  sigma_floor: 1.0e-4
+  query_chunk_size: 1024
+  grid_chunk_size: 128
+  macro_min_count: 10
+  learned_decoder:
+    enabled: true
+    min_train_count: 100
+    min_val_count: 20
+    alpha_grid: [0.0001, 0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
+  temperature_search:
+    min: 1.0e-4
+    max: 10.0
+    num: 81
+    scale: log
+  sigma_scale_search:
+    min: 0.05
+    max: 20.0
+    num: 81
+    scale: log
+  oracle:
+    sharp_temperature: 1.0e-4
+  cache:
+    batch_size: 16
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 4
+    shard_size: 4096
+
+
+probe:
+  architecture_version: adaptive_exact_time_probe_v1
+  source_name: z_context
+  cache_build:
+    max_patients_per_batch: 32
+    max_context_pairwise_elements: 4000000
+    max_set_pairwise_elements: 8000000
+  encoder:
+    architecture_variant: source_aware
+    hidden_dim: 256
+    num_heads: 4
+    temporal_layers: 1
+    num_pool_queries: 4
+    ffn_dim: 1024
+    dropout: 0.1
+    relative_query_chunk_size: 64
+  density_robustness:
+    enabled: false
+    retention_choices: [0.5, 0.7, 0.85]
+    protected_change_fraction: 0.1
+    consistency_weight: 0.0
+    consistency_warmup_epochs: 0
+    consistency_ramp_epochs: 0
+  training:
+    batch_size: 64
+    max_pairwise_elements_per_batch: 262144
+    max_patients_per_batch: 64
+    lr: 1.0e-4
+    weight_decay: 0.01
+    epochs: 30
+    min_epochs: 5
+    early_stopping_patience: 5
+    early_stopping_min_delta: 0.001
+    precision: bf16-mixed
+    gradient_clip_val: 1.0
+    effective_batch_patients: 256
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+  tasks:
+    mortality:
+      monitor: val/auprc
+      cutoff_min: 2880
+      binary_loss:
+        type: focal
+        pos_weight_mode: none
+        alpha: 0.75
+        gamma: 2.0
+    los_ge_3d:
+      monitor: val/auprc
+      cutoff_min: 1440
+      binary_loss:
+        type: unweighted_bce
+        pos_weight_mode: none
+    los_ge_7d:
+      monitor: val/auprc
+      cutoff_min: 1440
+      binary_loss:
+        type: focal
+        pos_weight_mode: none
+        alpha: 0.7
+        gamma: 2.0
+    readmission:
+      monitor: val/auprc
+      binary_loss:
+        type: focal
+        pos_weight_mode: none
+        alpha: 0.65
+        gamma: 2.0
+    icd:
+      label_col: icd_codes
+      min_code_count: 20
+      max_codes: 2048
+      include_other_bucket: false
+      loss: asl
+      monitor: val/micro_auprc
+    hcup:
+      label_col: HCUP
+      min_code_count: 1
+      max_codes: 26
+      include_other_bucket: false
+      mapping_artifact: sample_data/MIMIC-IV/HCUP_CCS_CCSR/hcup_26_mapping.json
+      loss: asl
+      monitor: val/macro_auprc
+    drg:
+      label_col: drg_codes
+      min_code_count: 5
+      max_codes: 512
+      include_other_bucket: false
+      loss: competitive_unordered_set
+      monitor: val/micro_f1
+
+
+benchmark:
+  feature_builder:
+    value_space: standardized
+    missing_strategy: zero_imputation
+  runtime:
+    shard_size: 256
+    smoke_max_patients_per_split: 32
+    max_training_matrix_gib: 64.0
+  linear:
+    model_family: logistic_regression_linear_classifier
+    intercept: true
+    class_weight_candidates: [balanced]
+    weight_decay_candidates: [1.0e-4]
+    shared_lr: 1.0e-3
+    shared_batch_size: 8192
+    shared_epochs: 200
+    shared_patience: 20
+    min_delta: 1.0e-4
+    objective_relative_tolerance: 1.0e-5
+    gradient_norm_tolerance: 1.0e-4
+    fail_on_unconverged_max_epochs: true
+    max_epoch_relative_change_fail_threshold: 1.0e-3
+    max_epoch_gradient_norm_fail_threshold: 0.25
+  xgboost:
+    n_estimators: 200
+    n_estimators_candidates: [200]
+    max_depth: 4
+    max_depth_candidates: [4]
+    subsample: 0.8
+    colsample_bytree: 0.8
+    learning_rate: 0.05
+    learning_rate_candidates: [0.05]
+    n_jobs: -1
+    early_stopping_rounds: 20
+    multi_strategy: one_output_per_tree
+
+
+
+
+# ===========================================================================
+#  SHARED: Cross-Phase Numerical Guards
+# ===========================================================================
+shared:
+  numerical:
+    attention_qkv_clamp: 50.0     # Q/K/V input clamping in safe_attention (utils.py)
+    attention_score_clamp: 20.0   # Attention score clamping in safe_attention (utils.py)
